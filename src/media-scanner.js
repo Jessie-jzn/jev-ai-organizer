@@ -37,8 +37,10 @@ export function toPublicScan(scan, options = {}) {
   return {
     id: scan.id,
     items: (scan.items ?? []).map(item => item.type === 'media'
-      ? publicMediaItem(item)
-      : publicOrdinaryItem(item)),
+      ? { ...publicMediaItem(item), outputDirectory: scan.outputDirectory ?? '' }
+      : { ...publicOrdinaryItem(item), outputDirectory: scan.outputDirectory ?? '' }),
+    outputDirectory: scan.outputDirectory ?? '',
+    mode: scan.mode ?? 'normal',
     skipped: [...(scan.skipped ?? [])]
   };
 }
@@ -103,7 +105,8 @@ function groupLivePhotos(records) {
   // 只有同一标识的一张照片和一个视频才合并，避免误把普通文件绑在一起。
   const byIdentifier = new Map();
   for (const record of records) {
-    const identifier = validAssetIdentifier(record.raw.assetIdentifier);
+    const asset = validAssetIdentifier(record.raw.assetIdentifier);
+    const identifier = asset ? `${path.dirname(record.file.path)}:${asset}` : null;
     if (!identifier) continue;
     const group = byIdentifier.get(identifier) ?? [];
     group.push(record);
@@ -133,6 +136,7 @@ function singleMediaItem(record) {
     id: randomUUID(),
     type: 'media',
     name: record.file.name,
+    sourceRelativePath: record.file.sourceRelativePath,
     mediaType: facts.mediaType,
     mediaDirectory: facts.mediaType === 'video' ? '视频' : '照片',
     members: [memberFor(record)],
@@ -165,6 +169,7 @@ function livePhotoItem(photo, video) {
     id: randomUUID(),
     type: 'media',
     name: photo.file.name,
+    sourceRelativePath: photo.file.sourceRelativePath,
     mediaType: 'live-photo',
     mediaDirectory: '照片',
     members: [memberFor(photo), memberFor(video)],
@@ -186,7 +191,7 @@ function factsFor(record) {
 }
 
 function memberFor(record) {
-  return { name: record.file.name, path: record.file.path, identity: record.file.identity };
+  return { name: record.file.name, path: record.file.path, identity: record.file.identity, sourceDirectories: record.file.sourceDirectories };
 }
 
 function publicMediaItem(item) {
@@ -199,6 +204,7 @@ function publicMediaItem(item) {
     inferredDate: Boolean(facts.inferredDate),
     year: facts.year,
     month: facts.month,
+    day: facts.day,
     country: facts.country,
     city: facts.city,
     locationStatus: facts.locationStatus ?? 'unknown',
@@ -208,6 +214,7 @@ function publicMediaItem(item) {
     id: item.id,
     type: 'media',
     name: item.name,
+    sourceRelativePath: item.sourceRelativePath ?? item.name,
     mediaType: item.mediaType,
     mediaDirectory: item.mediaDirectory,
     members: (item.members ?? []).map(member => ({ name: member.name })),
@@ -219,7 +226,7 @@ function publicMediaItem(item) {
 }
 
 function publicOrdinaryItem(item) {
-  const { identity, path: privatePath, ...publicItem } = item;
+  const { identity, path: privatePath, sourceDirectories, allowOrdinary, ...publicItem } = item;
   return { ...publicItem, samples: [...(item.samples ?? [])] };
 }
 
@@ -227,7 +234,7 @@ function isFileCandidate(file) {
   return file && typeof file.path === 'string' && typeof file.name === 'string';
 }
 
-function isCandidate(file) {
+export function isCandidate(file) {
   const extension = path.extname(file.name).toLowerCase();
   return PHOTO_EXTENSIONS.has(extension) || VIDEO_EXTENSIONS.has(extension);
 }

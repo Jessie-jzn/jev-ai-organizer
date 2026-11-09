@@ -44,7 +44,7 @@ test('creates an inbox and persists scan and classification as pending review', 
   const moved = await f.post('/api/move', { scanId: scan.id, selections: [{ id: scan.items[0].id, category: '财务/待报销' }] });
   assert.equal(moved.status, 200);
   assert.equal((await moved.json()).entries[0].status, 'moved');
-  assert.equal((await fs.stat(path.join(f.root, '财务', '待报销', '发票.pdf'))).isFile(), true);
+  assert.equal((await fs.stat(path.join(f.root, scan.outputDirectory, '财务', '待报销', '发票.pdf'))).isFile(), true);
   const pendingAfterMove = await (await fetch(`${f.base}/api/pending?inboxId=${inbox.id}`, { headers: f.headers })).json();
   assert.deepEqual(pendingAfterMove, []);
 });

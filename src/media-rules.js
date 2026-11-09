@@ -32,6 +32,7 @@ export function resolveMediaFacts(input = {}) {
     inferredDate: date?.inferred ?? false,
     year: date?.year ?? UNKNOWN_DATE,
     month: date?.month ?? UNKNOWN_MONTH,
+    day: date?.day ?? '未知日期',
     latitude: coordinates.latitude,
     longitude: coordinates.longitude,
     country: resolvedPlace ? sanitizeSegment(place.country, UNKNOWN_COUNTRY) : UNKNOWN_COUNTRY,
@@ -72,7 +73,7 @@ function parseFilesystemDate(value, timeZone) {
   const date = value instanceof Date ? value : new Date(value);
   if (!(date instanceof Date) || Number.isNaN(date.getTime())) return null;
   const parts = yearMonthInTimeZone(date, timeZone);
-  return parts && dateFact(parts.year, parts.month, date.toISOString(), 'filesystem', true);
+  return parts && { ...dateFact(parts.year, parts.month, date.toISOString(), 'filesystem', true), day: parts.day };
 }
 
 function parseIsoDate(value, zone) {
@@ -99,16 +100,16 @@ function yearMonthInTimeZone(date, timeZone) {
   try {
     const parts = new Intl.DateTimeFormat('en-US', {
       timeZone: timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone,
-      year: 'numeric', month: '2-digit'
+      year: 'numeric', month: '2-digit', day: '2-digit'
     }).formatToParts(date);
-    return { year: parts.find(part => part.type === 'year')?.value, month: parts.find(part => part.type === 'month')?.value };
+    return { year: parts.find(part => part.type === 'year')?.value, month: parts.find(part => part.type === 'month')?.value, day: parts.find(part => part.type === 'day')?.value };
   } catch {
     return null;
   }
 }
 
 function dateFact(year, month, capturedAt, source, inferred) {
-  return { year, month, capturedAt, source, inferred };
+  return { year, month, day: capturedAt.slice(8, 10), capturedAt, source, inferred };
 }
 
 function validCoordinates(latitude, longitude) {

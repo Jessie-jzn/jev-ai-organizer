@@ -26,7 +26,7 @@ async function fixture(t, options = {}) {
   await fs.writeFile(path.join(root, 'doc.txt'), 'document fixture');
   let queries = 0, classifications = 0, inspections = 0, failed = false;
   const server = createApp({ dataDir: path.join(temp, 'data'), platform: 'darwin', mediaHelper: async () => '/fixture/helper',
-    classifyItems: async items => { classifications++; return items.map(item => ({ id: item.id, category: '学习' })); },
+    classifyItems: async items => { classifications++; return items.map(item => ({ id: item.id, category: '文档' })); },
     scanOptions: {
       inspectMedia: async paths => { inspections++; return paths.map(file => ({ path: file, kind: 'photo', capturedAt: '2026-09-21T14:30:00+08:00', latitude: 31.23045678, longitude: 121.47375678, assetIdentifier: 'private-asset' })); },
       reverseGeocode: async points => { queries++; return points.map(point => ({ key: point.key, status: failed ? 'unresolved' : 'resolved', country: '中国', city: '上海' })); },
@@ -35,7 +35,7 @@ async function fixture(t, options = {}) {
   server.address = () => ({ port: 3210 });
   t.after(async () => { server.closeAllConnections(); await fs.rm(temp, { recursive: true, force: true }); });
   const session = (await dispatch(server, '/api/session')).body;
-  return { root, session, post: (route, body) => dispatch(server, `/api/${route}`, body, session.token), queries: () => queries, inspections: () => inspections, classifications: () => classifications, fail: () => { failed = true; } };
+  return { root, session, get: route => dispatch(server, `/api/${route}`, undefined, session.token), post: (route, body) => dispatch(server, `/api/${route}`, body, session.token), queries: () => queries, inspections: () => inspections, classifications: () => classifications, fail: () => { failed = true; } };
 }
 
 test('fresh request handler recovers a partial Live Photo on scan before any history request', async t => {
@@ -91,12 +91,12 @@ test('request handler blocks media classification and non-schema moves before fi
   assert.equal((await f.post('classify', { scanId: scan.id, itemIds: [ordinary.id, media.id] })).status, 400);
   assert.equal(f.classifications(), 0);
   assert.equal((await f.post('classify', { scanId: scan.id, itemIds: [ordinary.id] })).status, 200);
-  assert.equal(f.classifications(), 1);
+  assert.equal(f.classifications(), 0);
   for (const selection of [
     { id: media.id, media: {}, target: '/tmp/escape' }, { id: media.id, media: {}, targetSegments: ['2026'] },
     { id: media.id, media: { target: '/tmp/escape' } }, { id: media.id, media: { extra: true } },
     { id: media.id, media: { month: '13' } }, { id: media.id, media: { month: 9 } },
-    { id: ordinary.id, category: '学习', media: {} }, { id: ordinary.id, category: '学习', extra: true }
+    { id: ordinary.id, category: '文档', media: {} }, { id: ordinary.id, category: '文档', extra: true }
   ]) {
     assert.equal((await f.post('move', { scanId: scan.id, selections: [selection] })).status, 400, JSON.stringify(selection));
     assert.equal(await fs.readFile(path.join(f.root, 'photo.jpg'), 'utf8'), 'photo fixture');
@@ -104,7 +104,7 @@ test('request handler blocks media classification and non-schema moves before fi
   const moved = await f.post('move', { scanId: scan.id, selections: [{ id: media.id, media: { year: '2026', month: '09', country: '中国', city: '杭州', mediaType: 'photo' } }] });
   assert.equal(moved.status, 200);
   assert.equal(moved.body.entries[0].status, 'moved');
-  assert.equal(await fs.readFile(path.join(f.root, '2026/09/中国/杭州/照片/photo.jpg'), 'utf8'), 'photo fixture');
+  assert.equal(await fs.readFile(path.join(f.root, scan.outputDirectory, '照片视频/2026/2026-09/2026-09-21/photo.jpg'), 'utf8'), 'photo fixture');
   assert.equal((await f.post('undo', { id: moved.body.id })).body.entries[0].status, 'undone');
   assert.equal(await fs.readFile(path.join(f.root, 'photo.jpg'), 'utf8'), 'photo fixture');
 });
@@ -125,7 +125,7 @@ for (const route of ['pick-folder', 'scan', 'classify', 'undo']) {
     const f = await fixture(t, { chooseFolder: async root => { picks++; return root; } });
     const scan = (await f.post('scan', { root: f.root })).body;
     const item = scan.items.find(item => item.type === 'file');
-    const moved = (await f.post('move', { scanId: scan.id, selections: [{ id: item.id, category: '学习' }] })).body;
+    const moved = (await f.post('move', { scanId: scan.id, selections: [{ id: item.id, category: '文档' }] })).body;
     const before = f.inspections();
     const valid = { 'pick-folder': { root: f.root }, scan: { root: f.root, resolveLocations: true }, classify: { scanId: scan.id, itemIds: [item.id] }, undo: { id: moved.id } }[route];
     for (const extra of [{ extra: true }, { target: '/tmp/escape' }]) {
@@ -134,8 +134,23 @@ for (const route of ['pick-folder', 'scan', 'classify', 'undo']) {
       assert.equal(f.inspections(), before);
       assert.equal(f.queries(), 0);
       assert.equal(f.classifications(), 0);
-      assert.equal(await fs.readFile(path.join(f.root, '学习/doc.txt'), 'utf8'), 'document fixture');
+      assert.equal(await fs.readFile(path.join(f.root, scan.outputDirectory, '文档/doc.txt'), 'utf8'), 'document fixture');
     }
     assert.equal((await f.post(route, valid)).status, 200);
   });
 }
+
+
+test('reorganize inbox pending entries retain the exact nested ordinary source', async t => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.root, '文档'));
+  await fs.writeFile(path.join(f.root, '文档', 'doc.txt'), 'nested document');
+  const inbox = (await f.post('inboxes', { name: '重整测试', root: f.root, taxonomy: [{ name: '文档' }] })).body;
+  const response = await f.post('scan', { root: f.root, inboxId: inbox.id, mode: 'reorganize' });
+  assert.equal(response.status, 200);
+  const nested = response.body.items.find(item => item.sourceRelativePath === '文档/doc.txt');
+  assert.ok(nested);
+  assert.equal(JSON.stringify(nested).includes('sourceDirectories'), false);
+  const pending = (await f.get(`pending?inboxId=${inbox.id}`)).body.find(item => item.id === nested.id);
+  assert.equal(pending.source, path.join(await fs.realpath(f.root), '文档', 'doc.txt'));
+});

@@ -89,8 +89,8 @@ test('real native media metadata survives scan, grouped move and undo byte for b
     for (const member of entry.members) {
       assert.equal(await digest(member.target), expectedByName.get(member.name).sha256);
       assert.equal(await fs.access(member.source).then(() => true, () => false), false);
-      assert.ok(member.target.includes('/中国/上海/'));
-      if (entry.kind === 'group') assert.equal(path.basename(path.dirname(member.target)), '照片');
+      assert.ok(/\/\d{4}\/\d{4}-\d{2}\//.test(member.target));
+      if (entry.kind === 'group') assert.match(path.basename(path.dirname(member.target)), /^\d{4}-\d{2}-\d{2}$/);
     }
   }
   const undone = await new Organizer(path.join(base, 'journal')).undo(batch.id);

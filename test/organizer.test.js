@@ -22,8 +22,8 @@ test('scan samples folder names, excludes links, hidden files and category conta
   await fs.writeFile(path.join(root, '摄影课程', '第一课.mp4'), 'content stays local');
   await fs.symlink(path.join(root, '摄影课程'), path.join(root, 'link'));
   const scan = await app.scan(root);
-  assert.deepEqual(scan.items.map(f => f.name), ['摄影课程']);
-  assert.deepEqual(scan.items[0].samples, ['第一课.mp4']);
+  assert.deepEqual(scan.items.map(f => f.name), ['第一课.mp4']);
+  assert.equal(scan.items[0].sourceRelativePath, '摄影课程/第一课.mp4');
   assert.ok(scan.items[0].id);
 });
 

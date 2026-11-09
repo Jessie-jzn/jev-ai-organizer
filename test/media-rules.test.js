@@ -15,7 +15,7 @@ test('uses an embedded timestamp with an offset before every fallback', () => {
   assert.equal(facts.year, '2026');
   assert.equal(facts.month, '10');
   assert.deepEqual(buildMediaSegments({ ...facts, country: '中国', city: '上海' }),
-    ['2026', '10', '中国', '上海', '照片']);
+    ['照片视频', '2026', '2026-10', '2026-10-01']);
 });
 
 test('interprets metadata without an offset as a local clock in the requested timezone', () => {
@@ -118,7 +118,7 @@ test('uses unknown date segments only after every date source is unavailable', (
   const facts = resolveMediaFacts({ metadata: { kind: 'photo', capturedAt: 'not-a-date' }, name: 'clip.mp4', birthtime: null, timeZone: 'UTC' });
 
   assert.equal(facts.dateSource, 'unknown');
-  assert.deepEqual(buildMediaSegments(facts), ['未知日期', '未知月份', '未知国家', '未知城市', '照片']);
+  assert.deepEqual(buildMediaSegments(facts), ['照片视频', '日期待确认']);
 });
 
 test('keeps only valid coordinates and applies an optional resolved place', () => {
@@ -153,8 +153,8 @@ test('limits path segments to 80 Unicode code points', () => {
 });
 
 test('rejects invalid year and month values and permits a Live Photo directory override', () => {
-  assert.throws(() => buildMediaSegments({ year: '..', month: '09', country: '中国', city: '上海', mediaType: 'photo' }), /invalid year/);
+  assert.throws(() => buildMediaSegments({ year: '..', month: '09', day: '21', country: '中国', city: '上海', mediaType: 'photo' }), /invalid year/);
   assert.throws(() => buildMediaSegments({ year: '2026', month: '13', country: '中国', city: '上海', mediaType: 'photo' }), /invalid month/);
-  assert.deepEqual(buildMediaSegments({ year: '2026', month: '09', country: '中国', city: '上海', mediaType: 'video' }, { mediaType: 'live-photo' }),
-    ['2026', '09', '中国', '上海', '照片']);
+  assert.deepEqual(buildMediaSegments({ year: '2026', month: '09', day: '21', country: '中国', city: '上海', mediaType: 'video' }, { mediaType: 'live-photo' }),
+    ['照片视频', '2026', '2026-09', '2026-09-21']);
 });

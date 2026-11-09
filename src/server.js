@@ -6,6 +6,7 @@ import { randomBytes } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Organizer } from './organizer.js';
 import { classify } from './classifier.js';
+import { fileTypeCategories } from './file-types.js';
 import { categoryNames } from './categories.js';
 import { pickFolder } from './folder-picker.js';
 import { ensureMediaHelper } from './media-native.js';
@@ -16,7 +17,7 @@ const projectDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const requestKeys = new Map([
   ['/api/pick-folder', ['root']],
   ['/api/inboxes', ['id', 'name', 'root', 'taxonomy']],
-  ['/api/scan', ['root', 'resolveLocations', 'inboxId']],
+  ['/api/scan', ['root', 'resolveLocations', 'inboxId', 'mode']],
   ['/api/classify', ['scanId', 'itemIds']],
   ['/api/pending/update', ['id', 'changes']],
   ['/api/move', ['scanId', 'selections']],
@@ -82,7 +83,7 @@ export function createApp({ dataDir = path.join(projectDir, '.data'), chooseFold
         res.writeHead(200, { 'Content-Type': contentType }); return res.end(content);
       }
       if (req.method === 'GET' && route === '/api/session') {
-        return json(200, { token, categories: categoryNames, aiEnabled: Boolean(process.env.TYPESAFE_API_KEY?.trim()), mediaSupported: await supportsMedia(), defaultRoot: path.join(os.homedir(), 'Downloads') });
+        return json(200, { token, categories: fileTypeCategories, aiEnabled: Boolean(process.env.TYPESAFE_API_KEY?.trim()), mediaSupported: await supportsMedia(), defaultRoot: path.join(os.homedir(), 'Downloads') });
       }
       if (!route.startsWith('/api/')) return json(404, { error: '页面不存在。' });
       if (req.headers['x-session-token'] !== token) return json(403, { error: '会话已过期，请刷新页面。' });
@@ -116,7 +117,7 @@ export function createApp({ dataDir = path.join(projectDir, '.data'), chooseFold
         if (Object.hasOwn(body, 'resolveLocations') && typeof body.resolveLocations !== 'boolean') throw new Error('地点解析选项必须为布尔值。');
         const inbox = body.inboxId === undefined ? null : await inboxes.get(body.inboxId);
         const resolveLocations = body.resolveLocations === true;
-        const scan = await organizer.scan(body.root, { resolveLocations, categories: inbox ? taxonomyChoices(inbox.taxonomy) : undefined });
+        const scan = await organizer.scan(body.root, { resolveLocations, mode: body.mode, preserveFolders: true, categories: inbox ? taxonomyChoices(inbox.taxonomy) : fileTypeCategories });
         const retained = organizer.getScan(scan.id);
         retained.inboxId = body.inboxId;
         scan.root = retained.root;
@@ -131,11 +132,11 @@ export function createApp({ dataDir = path.join(projectDir, '.data'), chooseFold
         }
         if (body.inboxId) {
           for (const item of retained.items) {
-            const member = item.type === 'media' ? item.members?.[0] : { name: item.name, identity: item.identity };
+            const member = item.type === 'media' ? item.members?.[0] : { name: item.name, path: item.path, identity: item.identity };
             if (!member) continue;
             await pending.upsert({ id: item.id, inboxId: body.inboxId, scanId: scan.id, name: item.name,
-              type: item.type, source: path.join(retained.root, member.name), identity: member.identity,
-              category: null, destination: null, recommendationSource: 'unclassified', status: 'pending' });
+              type: item.type, source: member.path ?? path.join(retained.root, member.name), identity: member.identity,
+              category: item.category ?? null, destination: null, recommendationSource: item.recommendationSource ?? 'unclassified', status: 'pending' });
           }
         }
         return json(200, scan);
@@ -153,7 +154,9 @@ export function createApp({ dataDir = path.join(projectDir, '.data'), chooseFold
         classifying = true;
         try {
           const inbox = scan.inboxId ? await inboxes.get(scan.inboxId) : null;
-          const results = await classifyItems(items, undefined, inbox ? taxonomyChoiceDescriptions(inbox.taxonomy) : undefined);
+          const results = inbox
+            ? await classifyItems(items, undefined, taxonomyChoiceDescriptions(inbox.taxonomy))
+            : items.map(item => ({ id: item.id, category: item.category, confidence: 1 }));
           if (scan.inboxId) {
             for (const result of results) {
               const current = (await pending.list(scan.inboxId)).find(item => item.id === result.id);
@@ -169,9 +172,9 @@ export function createApp({ dataDir = path.join(projectDir, '.data'), chooseFold
         const scan = organizer.getScan(body.scanId);
         const batch = await organizer.move(body.scanId, body.selections);
         if (scan.inboxId) {
-          const movedNames = new Set(batch.entries.filter(entry => entry.status === 'moved').map(entry => entry.name));
+          const movedIds = new Set(batch.entries.filter(entry => entry.status === 'moved').map(entry => entry.scanItemId));
           const current = await pending.list(scan.inboxId);
-          await pending.remove(current.filter(item => movedNames.has(item.name)).map(item => item.id));
+          await pending.remove(current.filter(item => movedIds.has(item.id)).map(item => item.id));
         }
         return json(200, batch);
       }
@@ -199,7 +202,7 @@ function validateSelections(scan, selections) {
     if (item.type !== 'media') continue;
     const media = selection.media;
     if (!media || typeof media !== 'object' || Array.isArray(media)
-        || Object.keys(media).some(key => !['year', 'month', 'country', 'city', 'mediaType'].includes(key))
+        || Object.keys(media).some(key => !['year', 'month', 'day', 'country', 'city', 'mediaType'].includes(key))
         || Object.values(media).some(value => typeof value !== 'string')) throw new Error('媒体调整字段无效。');
     if (item.mediaType === 'live-photo' && media.mediaType !== undefined && media.mediaType !== 'live-photo') throw new Error('Live Photo 必须一起归入照片。');
   }

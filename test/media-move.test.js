@@ -7,7 +7,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Organizer } from '../src/organizer.js';
 
 const media = { year: '2026', month: '09', country: '中国', city: '上海', mediaType: 'photo' };
-const segments = ['2026', '09', '中国', '上海', '照片'];
+const segments = ['照片视频', '2026', '2026-09', '2026-09-21'];
 const digest = async file => createHash('sha256').update(await fs.readFile(file)).digest('hex');
 const absent = async file => assert.rejects(fs.lstat(file), { code: 'ENOENT' });
 const identity = stat => ({ dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs, type: stat.isDirectory() ? 'folder' : 'file' });
@@ -56,7 +56,7 @@ test('server builds structured media paths, moves stable groups and undoes with 
   const batch = await f.organizer.move(f.scan.id, [{ ...f.selection, media: { ...media, mediaType: 'video' }, target: '/outside', members: [] }]);
   const entry = batch.entries[0];
   assert.equal(entry.status, 'moved'); assert.equal(entry.kind, 'group');
-  assert.equal(entry.members.length, 2); assert.equal(entry.containers.length, 5);
+  assert.equal(entry.members.length, 2); assert.equal(entry.containers.length, 4);
   assert.deepEqual(renames, ['A.HEIC', 'B.MOV']);
   await hashesAt(f, f.target);
   const undone = await f.organizer.undo(batch.id);
@@ -65,11 +65,11 @@ test('server builds structured media paths, moves stable groups and undoes with 
   await hashesAt(f, f.root);
 });
 
-test('single media type override selects video directory', async t => {
+test('single media type override retains the shared monthly directory', async t => {
   const f = await fixture(t, { single: true });
   const batch = await f.organizer.move(f.scan.id, [{ ...f.selection, media: { ...media, mediaType: 'video' } }]);
   assert.equal(batch.entries[0].kind, 'single');
-  await hashesAt(f, path.join(f.root, '2026/09/中国/上海/视频'));
+  await hashesAt(f, path.join(f.root, '照片视频/2026/2026-09/2026-09-21'));
   await f.organizer.undo(batch.id); await hashesAt(f, f.root);
 });
 
@@ -83,7 +83,7 @@ test('rejects traversal, invalid segments and forged media IDs before moving', a
   await hashesAt(f, f.root);
 });
 
-for (const mode of ['symlink', 'file']) for (let depth = 0; depth < 5; depth++) {
+for (const mode of ['symlink', 'file']) for (let depth = 0; depth < segments.length; depth++) {
   test(`rejects ${mode} target container at level ${depth + 1}`, async t => {
     const f = await fixture(t), parent = path.join(f.root, ...segments.slice(0, depth));
     await fs.mkdir(parent, { recursive: true });
@@ -300,7 +300,7 @@ test('blank place overrides use unknown directories', async t => {
   const f = await fixture(t, { single: true });
   const batch = await f.organizer.move(f.scan.id, [{ ...f.selection, media: { ...media, country: '  ', city: '' } }]);
   assert.equal(batch.entries[0].status, 'moved');
-  await hashesAt(f, path.join(f.root, '2026/09/未知国家/未知城市/照片'));
+  await hashesAt(f, path.join(f.root, '照片视频/2026/2026-09/2026-09-21'));
 });
 
 test('changed ancestor after pending journal is never followed', async t => {
@@ -310,13 +310,13 @@ test('changed ancestor after pending journal is never followed', async t => {
     await save(batch);
     if (batch.entries[0].status === 'pending' && !swapped) {
       swapped = true;
-      await fs.rename(path.join(f.root, '2026'), path.join(f.base, 'relocated'));
-      await fs.symlink(path.join(f.base, 'relocated'), path.join(f.root, '2026'));
+      await fs.rename(path.join(f.root, '照片视频'), path.join(f.base, 'relocated'));
+      await fs.symlink(path.join(f.base, 'relocated'), path.join(f.root, '照片视频'));
     }
   };
   const batch = await f.organizer.move(f.scan.id, [f.selection]);
   assert.equal(batch.entries[0].status, 'uncertain'); await hashesAt(f, f.root);
-  await absent(path.join(f.base, 'relocated/09/中国/上海/照片/A.HEIC'));
+  await absent(path.join(f.base, 'relocated/2026/2026-09/2026-09-21/A.HEIC'));
 });
 
 test('all source identities are checked again after the pending journal write', async t => {
@@ -414,16 +414,16 @@ test('ordinary scanned filenames keep legal backslashes without interpreting the
   assert.equal(await fs.readFile(path.join(f.root, name), 'utf8'), 'ordinary');
 });
 
-for (const sourceType of ['folder', 'file']) for (const order of ['ordinary-first', 'media-first']) {
-  test(`rejects overlapping ${sourceType} year source and media target before any mutation (${order})`, async t => {
-    const f = await fixture(t), source = path.join(f.root, '2026');
+for (const sourceType of ['file']) for (const order of ['ordinary-first', 'media-first']) {
+  test(`rejects overlapping ${sourceType} archive source and media target before any mutation (${order})`, async t => {
+    const f = await fixture(t), source = path.join(f.root, '照片视频');
     if (sourceType === 'folder') {
       await fs.mkdir(source); await fs.writeFile(path.join(source, 'notes.txt'), 'original notes');
     } else await fs.writeFile(source, 'original notes');
     const beforeRoot = await fs.readdir(f.root);
     const beforeIdentity = identity(await fs.lstat(source));
     const scan = await f.organizer.scan(f.root);
-    const ordinary = { id: scan.items.find(item => item.name === '2026').id, category: '工作' };
+    const ordinary = { id: scan.items.find(item => item.name === '照片视频').id, category: '工作' };
     const selection = { id: scan.items.find(item => item.type === 'media').id, media };
     const choices = order === 'ordinary-first' ? [ordinary, selection] : [selection, ordinary];
     await assert.rejects(f.organizer.move(scan.id, choices), /路径.*冲突/);

@@ -3,16 +3,16 @@ import assert from 'node:assert/strict';
 import { canMove, flattenTaxonomy, mediaDestinationPaths, matchesFilter, selectionFor } from '../ui/item-model.js';
 
 const live = { id: 'live', type: 'media', name: 'live.heic', mediaType: 'live-photo',
-  members: [{ name: 'live.heic' }, { name: 'live.mov' }], year: '2026', month: '09',
+  members: [{ name: 'live.heic' }, { name: 'live.mov' }], year: '2026', month: '09', day: '21',
   country: '中国', city: '杭州:', locationStatus: 'resolved', dateSource: 'embedded' };
 
 test('React media preview and structured selection follow the shared server path rules', () => {
   assert.deepEqual(mediaDestinationPaths(live), [
-    '2026 / 09 / 中国 / 杭州 / 照片 / live.heic',
-    '2026 / 09 / 中国 / 杭州 / 照片 / live.mov'
+    '照片视频 / 2026 / 2026-09 / 2026-09-21 / live.heic',
+    '照片视频 / 2026 / 2026-09 / 2026-09-21 / live.mov'
   ]);
-  assert.deepEqual(selectionFor(live), { id: 'live', media: { year: '2026', month: '09', country: '中国', city: '杭州:' } });
-  assert.equal(canMove({ ...live, city: '../escape' }), false);
+  assert.deepEqual(selectionFor(live), { id: 'live', media: {} });
+  assert.equal(canMove({ ...live, year: '../escape' }), false);
   assert.equal(matchesFilter(live, 'live-photo'), true);
   assert.equal(matchesFilter(live, 'video'), false);
 });
@@ -28,4 +28,11 @@ test('React flattens the selected inbox taxonomy into stable category paths', ()
   assert.deepEqual(flattenTaxonomy([{ name: '工作', path: '工作', children: [{ name: '会议', path: '工作/会议', children: [] }] }]), [
     { value: '工作', label: '工作' }, { value: '工作/会议', label: '工作 / 会议' }
   ]);
+});
+
+test('completed groups contain only successful moves and retain batch identity', async () => {
+  const { completedBatches } = await import('../ui/item-model.js');
+  const batches = [{ id: 'mixed', root: '/example', entries: [{ name: 'done', status: 'moved' }, { name: 'failed', status: 'skipped' }, { name: 'ambiguous', status: 'uncertain' }] }, { id: 'undone', entries: [{ name: 'restored', status: 'undone' }] }];
+  assert.deepEqual(completedBatches(batches), [{ id: 'mixed', root: '/example', entries: [{ name: 'done', status: 'moved' }] }]);
+  assert.equal(batches[0].entries.length, 3);
 });

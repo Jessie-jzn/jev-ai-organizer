@@ -1,13 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { MediaRow, OrdinaryRow } from './Rows.jsx';
 import {
-  canMove, dateReview, flattenTaxonomy, isMedia, locationReview, matchesFilter, needsReview, selectionFor, targetFor, mediaLabel
+  canMove, completedBatches, dateReview, flattenTaxonomy, isMedia, matchesFilter, needsReview, selectionFor, targetFor, mediaLabel
 } from './item-model.js';
 
 // 页面筛选项和历史状态的显示文案集中定义，避免 JSX 中散落字符串。
 const filters = [
   ['all', '全部项目'], ['file', '文件'], ['folder', '文件夹'], ['photo', '照片'],
-  ['video', '视频'], ['live-photo', 'Live Photo'], ['location-review', '地点待确认'],
+  ['video', '视频'], ['live-photo', 'Live Photo'],
   ['date-review', '日期待确认'], ['review', '待确认']
 ];
 const statuses = { moved: '已移动', skipped: '已跳过', undone: '已撤销', ready: '未执行', pending: '待恢复', undoing: '撤销中', uncertain: '需手动核对' };
@@ -25,20 +25,24 @@ async function api(route, body, token) {
 }
 
 // 操作记录页：展示批次、每个项目的结果，并提供整批撤销入口。
-function History({ batches, busy, onRefresh, onUndo }) {
-  return <section id="history-view"><div className="page-heading"><div><div className="eyebrow">EVERY MOVE HAS A WAY BACK</div>
-    <h1>每一步，都有迹可循<span>。</span></h1><p>查看整理结果；撤销会将文件或文件夹移回原位置。</p>
-    </div><button id="refresh-history" className="secondary" disabled={busy} onClick={onRefresh}>刷新记录</button></div>
-    <div id="history-list">{batches.length ? batches.map(batch => <article className="panel history-card" key={batch.id}>
+function History({ batches, busy, onRefresh, onUndo, completed = false }) {
+  const prefix = completed ? 'completed' : 'history';
+  const shown = completed ? completedBatches(batches) : batches;
+  return <section id={`${prefix}-view`}><div className="page-heading"><div><div className="eyebrow">EVERY MOVE HAS A WAY BACK</div>
+    <h1>{completed ? '已经归位的文件' : '每一步，都有迹可循'}<span>。</span></h1><p>{completed ? '只展示已成功移动的项目和归档位置。失败、跳过及已撤销的项目不会出现在这里。' : '查看完整整理结果；撤销会将文件或文件夹移回原位置。'}</p>
+    </div><button id={`refresh-${prefix}`} className="secondary" disabled={busy} onClick={onRefresh}>刷新记录</button></div>
+    <div id={`${prefix}-list`}>{shown.length ? shown.map(batch => <article className="panel history-card" key={batch.id}>
       <div className="history-head"><div><h2>{new Date(batch.createdAt).toLocaleString('zh-CN')} · {batch.entries.length} 个项目</h2>
-        <div className="history-root">{batch.root}</div></div>
+        <div className="history-root">{batch.root}</div>
+        {batch.cleanupDirectories?.length > 0 && <p className="subtle">已清理 {batch.cleanupDirectories.filter(directory => directory.state === 'removed').length} 个空源目录 · 撤销时恢复目录</p>}
+        {batch.cleanupDirectories?.filter(directory => directory.error || directory.state === 'uncertain').map(directory => <p className="media-error" key={directory.path}>{directory.path}：{directory.error || '目录状态需要手动核对'}</p>)}</div>
         {batch.entries.some(entry => entry.status === 'moved') && <button className="secondary" data-undo={batch.id} disabled={busy}
           onClick={() => onUndo(batch.id)}>↶ 撤销此批次</button>}
       </div><ul className="history-entries">{batch.entries.map((entry, index) => <li key={`${entry.name}-${index}`}>
         <span>{entry.type === 'media' ? mediaLabel(entry) : entry.type === 'file' ? '文件' : '文件夹'} · {entry.name} → {entry.targetSegments?.join(' / ') || entry.category}</span>
         <span className="history-status">{statuses[entry.status] || entry.status}</span>
         <small>{entry.source} → {entry.target}</small>{entry.error && <small className="entry-error">{entry.error}</small>}
-      </li>)}</ul></article>) : <div className="panel empty"><div className="empty-icon">◷</div><h3>还没有整理记录</h3><p>执行整理后，每一次移动都会记录在这里。</p></div>}</div>
+      </li>)}</ul></article>) : <div className="panel empty"><div className="empty-icon">◷</div><h3>{completed ? '还没有已整理项目' : '还没有整理记录'}</h3><p>{completed ? '成功整理的项目会从待整理列表移到这里。' : '执行整理后，每一次移动都会记录在这里。'}</p></div>}</div>
   </section>;
 }
 
@@ -49,6 +53,7 @@ export default function App() {
   const [inboxId, setInboxId] = useState('');
   const [pending, setPending] = useState([]);
   const [root, setRoot] = useState('');
+  const [mode, setMode] = useState('normal');
   const [scan, setScan] = useState(null);
   const [items, setItems] = useState([]);
   const [view, setView] = useState('organize');
@@ -57,9 +62,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [notice, setNotice] = useState({ text: '', error: false });
-  const [resolveLocations, setResolveLocations] = useState(false);
   const [metadataStatus, setMetadataStatus] = useState('拍摄信息：等待扫描');
-  const [locationStatus, setLocationStatus] = useState('地点查询：未开启');
   const [auto, setAuto] = useState(false);
   const [history, setHistory] = useState([]);
   const [pendingMove, setPendingMove] = useState([]);
@@ -133,27 +136,24 @@ export default function App() {
     run(async () => {
       setScan(null); setItems([]);
       setMetadataStatus('拍摄信息：正在读取…');
-      setLocationStatus(resolveLocations ? '地点查询：正在处理…' : '地点查询：未开启');
       let result;
-      try { result = await api('scan', { root: root.trim(), resolveLocations, ...(inboxId ? { inboxId } : {}) }, session.token); }
+      try { result = await api('scan', { root: root.trim(), mode, resolveLocations: false, ...(inboxId ? { inboxId } : {}) }, session.token); }
       catch (error) {
         setMetadataStatus('拍摄信息：扫描未完成');
-        setLocationStatus(resolveLocations ? '地点查询：扫描未完成' : '地点查询：未开启');
         throw error;
       }
       setScan(result); setRoot(result.root || root.trim());
       const savedPending = inboxId ? await loadPending(inboxId) : [];
-      const savedByName = new Map(savedPending.map(item => [item.name, item]));
+      const savedById = new Map(savedPending.map(item => [item.id, item]));
       setItems(result.items.map(item => {
-        const saved = savedByName.get(item.name);
-        return { ...item, category: saved?.category ?? null, confidence: saved?.confidence ?? null,
+        const saved = savedById.get(item.id);
+        return { ...item, category: saved?.category ?? item.category ?? null, confidence: saved?.confidence ?? item.confidence ?? null,
           manual: saved?.recommendationSource === 'manual', selected: false, error: saved?.error ?? null };
       }));
       const failed = result.items.filter(item => isMedia(item) && item.metadataStatus === 'failed').length;
       setMetadataStatus(session.mediaSupported ? `拍摄信息：读取完成${failed ? ` · ${failed} 项需手动确认` : ''}` : '拍摄信息：自动读取需要 macOS，当前不可用，可手动调整');
-      setLocationStatus(resolveLocations ? `地点查询：处理完成 · ${result.items.filter(locationReview).length} 项待确认` : '地点查询：未开启 · 可手动填写');
-      showNotice(`扫描完成：${result.items.length} 个项目。${result.skipped.length ? `已跳过 ${result.skipped.length} 个分类容器、隐藏、链接或不可读项目。` : ''}${result.items.length ? '可使用 AI 推荐标签，也可直接选择。' : ''}`);
-    }, '正在扫描直属文件与文件夹…');
+      showNotice(`扫描完成：${result.items.length} 个项目。${result.skipped.length ? `已跳过 ${result.skipped.length} 个分类容器、隐藏、链接或不可读项目。` : ''}${result.items.length ? selectedInbox ? '可使用收件箱分类建议，也可手动选择。' : '已按文件类型和媒体时间生成建议，请检查后勾选确认。' : ''}`);
+    }, '正在扫描文件并递归提取媒体…');
   };
 
   // 把当前勾选项提交给后端；后端负责校验、写日志和实际移动。
@@ -161,14 +161,14 @@ export default function App() {
     showNotice(`正在移动 ${moving.length} 个项目并保存操作记录…`);
     const batch = await api('move', { scanId: scan.id, selections: moving.map(selectionFor) }, session.token);
     const moved = batch.entries.filter(entry => entry.status === 'moved');
-    const movedNames = new Set(moved.map(entry => entry.name));
-    setItems(previous => previous.filter(item => !movedNames.has(item.name)).map(item => {
-      const skipped = batch.entries.find(entry => entry.name === item.name && entry.status !== 'moved');
+    const movedIds = new Set(moved.map(entry => entry.scanItemId));
+    setItems(previous => previous.filter(item => !movedIds.has(item.id)).map(item => {
+      const skipped = batch.entries.find(entry => entry.scanItemId === item.id && entry.status !== 'moved');
       return skipped ? { ...item, error: skipped.error, selected: false } : item;
     }));
     const skipped = batch.entries.filter(entry => entry.status !== 'moved');
     await loadPending(inboxId);
-    showNotice(`整理完成：已移动 ${moved.length} 个，跳过 ${skipped.length} 个。可在「操作记录」查看详情或撤销。${skipped.length ? '\n' + skipped.map(entry => `${entry.name}：${entry.error}`).join('\n') : ''}`, skipped.length > 0);
+    showNotice(`整理完成：已移动 ${moved.length} 个，跳过 ${skipped.length} 个。可在「已整理」查看成功项目，在「操作记录」查看完整结果或撤销。${skipped.length ? '\n' + skipped.map(entry => `${entry.name}：${entry.error}`).join('\n') : ''}`, skipped.length > 0);
   };
 
   // 将普通文件/文件夹的名称和样本交给 TypeSafe，回填推荐分类与评分。
@@ -199,7 +199,7 @@ export default function App() {
   const updateMedia = (id, field, value) => setItems(previous => previous.map(item => {
     if (item.id !== id) return item;
     const next = { ...item, [field]: value };
-    if (field === 'year' || field === 'month') next.dateEdited = true;
+    if (field === 'year' || field === 'month' || field === 'day') next.dateEdited = true;
     if (field === 'country' || field === 'city') next.locationEdited = Boolean(next.country?.trim() && next.city?.trim() && !next.country.startsWith('未知') && !next.city.startsWith('未知'));
     next.selected = canMove(next);
     return next;
@@ -219,6 +219,7 @@ export default function App() {
   // 读取并恢复未完成的操作日志，用于历史页和启动后的安全恢复。
   const loadHistory = async () => setHistory(await api('history', undefined, session.token));
   const showHistory = () => { setView('history'); run(loadHistory); };
+  const showCompleted = () => { setView('completed'); run(loadHistory); };
   // 请求后端按日志批次撤销；撤销后清空旧扫描，要求用户重新确认当前目录。
   const undo = id => run(async () => {
     const batch = await api('undo', { id }, session.token);
@@ -242,37 +243,36 @@ export default function App() {
   return <div data-react-app>
     <aside className="sidebar"><a className="brand" href="/" aria-label="Jev AI 归屿首页"><span className="brand-icon">▧</span><span>Jev AI 归屿<small>LOCAL ORGANIZER</small></span></a>
       <p className="nav-label">我的空间</p><nav aria-label="主导航">
-        <button className={`nav-item ${view === 'organize' ? 'active' : ''}`} id="nav-organize" onClick={() => setView('organize')}><span>▦</span> 分类整理 {view === 'organize' && <span className="nav-dot" />}</button>
+        <button className={`nav-item ${view === 'organize' ? 'active' : ''}`} id="nav-organize" onClick={() => setView('organize')}><span>▦</span> 待整理 {view === 'organize' && <span className="nav-dot" />}</button>
+        <button className={`nav-item ${view === 'completed' ? 'active' : ''}`} id="nav-completed" disabled={busy || !session} onClick={showCompleted}><span>✓</span> 已整理</button>
         <button className={`nav-item ${view === 'history' ? 'active' : ''}`} id="nav-history" onClick={showHistory}><span>◷</span> 操作记录</button>
-      </nav><div className="sidebar-note"><span className="note-icon">↳</span><strong>让每个项目，各归其位。</strong><p>文件与文件夹统一分类，<br />只改变它们所在的位置。</p></div>
+      </nav><div className="sidebar-note"><span className="note-icon">↳</span><strong>让每个项目，各归其位。</strong><p>文件按类型分类，媒体按日期归档，<br />只改变它们所在的位置。</p></div>
       <div className="local-badge"><i /> 本地运行 <span>Node.js</span></div>
     </aside>
-    <main><header className="topbar"><span>我的空间 <b>/</b> <span id="breadcrumb">{view === 'history' ? '操作记录' : '分类整理'}</span></span><span className="powered">Powered by <strong>TypeSafe AI</strong></span></header>
+    <main><header className="topbar"><span>我的空间 <b>/</b> <span id="breadcrumb">{view === 'history' ? '操作记录' : view === 'completed' ? '已整理' : '待整理'}</span></span><span className="powered">{selectedInbox ? <>Powered by <strong>TypeSafe AI</strong></> : '本机处理 · 预览确认 · 支持撤销'}</span></header>
       {view === 'organize' && <section id="organize-view">
-        <div className="page-heading"><div><div className="eyebrow">A LITTLE ORDER, A LITTLE CALM</div><h1>给文件和文件夹，一个好去处<span>。</span></h1><p>从杂乱到有序。让 AI 推荐标签，由你决定如何整理。</p></div><span className="heading-mark" aria-hidden="true">▱</span></div>
-        <section className="panel source-panel" aria-labelledby="source-title"><div className="section-title"><span className="step">01</span><h2 id="source-title">选择整理范围</h2><span className="subtle">扫描直属文件与文件夹</span></div>
+        <div className="page-heading"><div><div className="eyebrow">A LITTLE ORDER, A LITTLE CALM</div><h1>给散落的文件，一个好去处<span>。</span></h1><p>从杂乱到有序。普通文件按类型分类，照片和视频按拍摄年月日归档。确认后移动，并清理空的源目录。</p></div><span className="heading-mark" aria-hidden="true">▱</span></div>
+        <section className="panel source-panel" aria-labelledby="source-title"><div className="section-title"><span className="step">01</span><h2 id="source-title">选择整理范围</h2><span className="subtle">普通文件保留层级 · 媒体递归提取</span></div>
           {inboxes.length > 0 && <label className="inbox-select">收件箱<select id="inbox" value={inboxId} onChange={chooseInbox} disabled={busy}>
             <option value="">临时扫描（不保存待处理列表）</option>{inboxes.map(inbox => <option key={inbox.id} value={inbox.id}>{inbox.name}</option>)}
           </select></label>}
+          <label className="mode-select">整理模式<select id="scan-mode" value={mode} disabled={busy} onChange={event => {
+            setMode(event.target.value); setScan(null); setItems([]); setNotice({ text: '', error: false });
+          }}><option value="normal">日常整理</option><option value="reorganize">重新整理已有分类</option></select></label>
+          <p className="subtle">{mode === 'reorganize' ? '读取旧分类目录直属文件，保留更深的项目文件夹；媒体可递归提取。当前输出目录始终跳过。' : '只整理直属普通文件，媒体递归提取；已有分类和整理目录保持原位。'}</p>
+          {scan?.outputDirectory && <p id="output-directory" className="subtle">本次输出：{scan.outputDirectory} / · 媒体按拍摄年 / 年月 / 年月日归档</p>}
           <form id="scan-form" onSubmit={scanFolder}><label htmlFor="root">父目录路径</label><div className="path-row"><span aria-hidden="true">▱</span>
             <input id="root" placeholder="选择文件夹，或输入绝对路径" autoComplete="off" required value={root} onChange={event => setRoot(event.target.value)} disabled={busy} />
             <button type="button" className="secondary" id="pick-folder" onClick={pickFolder} disabled={busy || !session}>选择文件夹</button>
             <button type="submit" className="primary" id="scan-button" disabled={busy || !session}>扫描文件夹 <span>→</span></button></div></form>
-          <div className="location-consent"><label><input id="resolve-locations" type="checkbox" checked={resolveLocations}
-            disabled={busy || !session?.mediaSupported} onChange={event => {
-              const checked = event.target.checked;
-              setResolveLocations(checked);
-              setLocationStatus(checked ? '地点查询：已允许，请重新扫描后解析' : '地点查询：未开启；重新扫描后更新预览');
-            }} /><span>允许 Apple 根据 GPS 查询国家和城市</span></label>
-            <p>媒体文件留在本机；查询地点时，坐标可能发送给 Apple。勾选后请重新扫描，也可手动填写地点。</p></div>
-          <div className="scan-status" aria-live="polite"><span id="metadata-status">{metadataStatus}</span><span id="location-status">{locationStatus}</span>{inboxId && <span id="pending-status">待处理：{pending.filter(item => item.status === 'pending').length}</span>}</div>
-          <div className="source-footer"><span>AI 仅发送名称、扩展名与目录样本，不读取文件内容</span><span id="ai-status" className="status-pill">{session?.aiEnabled ? '✧ API Key 已配置' : session ? '未配置 API Key · 可手动整理' : '正在连接…'}</span></div>
+          <div className="scan-status" aria-live="polite"><span id="metadata-status">{metadataStatus}</span>{inboxId && <span id="pending-status">待处理：{pending.filter(item => item.status === 'pending').length}</span>}</div>
+          <div className="source-footer"><span>按类型分类无需 AI · 普通子文件夹保持原位 · 媒体内容留在本机</span><span id="ai-status" className="status-pill">{!session ? '正在连接…' : !selectedInbox ? '本机类型规则 · 无需 API Key' : session.aiEnabled ? '✧ API Key 已配置' : '未配置 API Key · 可手动整理'}</span></div>
         </section>
         <div id="notice" className={`notice${notice.error ? ' error' : ''}`} role="status" aria-live="polite" hidden={!notice.text}>{notice.text}</div>
         <section className="workspace" aria-labelledby="preview-title"><div className="workspace-heading"><div className="section-title"><span className="step">02</span><h2 id="preview-title">整理预览</h2><span className="count" id="folder-count">{items.length} 个项目 · {mediaCount} 媒体 / {fileCount} 文件 / {folderCount} 文件夹</span></div>
           <div className="actions"><button id="export" className="secondary" disabled={busy || !items.length} onClick={exportPlan}>↓ 导出结果</button>
-            <button id="classify" className="primary" disabled={busy || !items.some(item => !isMedia(item)) || !session?.aiEnabled}
-              title={session?.aiEnabled ? '根据名称和文件名样本推荐类别' : '请在 .env 设置 TYPESAFE_API_KEY 后重启服务'} onClick={classify}>✧ AI 推荐标签</button></div></div>
+            {selectedInbox && <button id="classify" className="primary" disabled={busy || !items.some(item => !isMedia(item)) || !session?.aiEnabled}
+              title={session?.aiEnabled ? '根据名称和文件名样本推荐类别' : '请在 .env 设置 TYPESAFE_API_KEY 后重启服务'} onClick={classify}>✧ AI 推荐标签</button>}</div></div>
           <div className="summary-grid"><div className="summary-card"><span className="summary-icon purple">▦</span><div><span>待整理项目</span><strong id="total-count">{scan ? items.length : '—'}</strong></div></div>
             <div className="summary-card"><span className="summary-icon green">✓</span><div><span>已确定位置</span><strong id="ready-count">{scan ? items.length - reviewCount : '—'}</strong></div></div>
             <div className="summary-card"><span className="summary-icon amber">◎</span><div><span>需要你确认</span><strong id="review-count">{scan ? reviewCount : '—'}</strong></div></div></div>
@@ -286,22 +286,25 @@ export default function App() {
                 ? <MediaRow key={item.id} item={item} root={scan.root} busy={busy} onEdit={updateMedia} onSelect={selectItem} />
                 : <OrdinaryRow key={item.id} item={item} root={scan.root} categories={taxonomyCategories} busy={busy} onCategory={updateCategory} onSelect={selectItem} />)}</tbody></table></div>
             <div id="empty" className="empty" hidden={visible.length > 0}><div className="empty-icon">▱</div><h3>{scan ? items.length ? '没有符合条件的项目' : '这里已经很整齐了' : '有序，从选择一个目录开始'}</h3>
-              <p>{scan ? items.length ? '试试其他搜索词或切换到全部项目。' : '未发现待整理的直属文件或文件夹。隐藏项目、符号链接和已有分类目录会跳过。' : '选择本机文件夹或输入路径，扫描后为每个项目找到合适的标签。'}</p>
-              {!scan && <div className="empty-tags">{['工作', '学习', '生活', '影音', '软件', '其他'].map(name => <span key={name}>{name}</span>)}</div>}</div>
-            <div className="table-bottom"><span id="selection-count">{scan ? `已选择 ${selected.length} / ${items.length} 个项目` : '尚未选择项目'}</span><span>同名冲突自动跳过 · 可撤销整理</span></div></div>
-          <div className="execution-bar"><label className="auto-option"><input id="auto" type="checkbox" checked={auto} disabled={busy || !session?.aiEnabled} onChange={event => setAuto(event.target.checked)} />
-            <span>自动整理高置信度结果<small>开启后，AI 推荐完成即移动置信度 ≥ 85% 且非「其他」的项目。</small></span></label>
-            <button id="move" className="primary" disabled={busy || !selected.length} onClick={() => { setPendingMove(selected); dialog.current.showModal(); }}>执行整理{selected.length ? `（${selected.length}）` : ''} <span>→</span></button></div>
+              <p>{scan ? items.length ? '试试其他搜索词或切换到全部项目。' : '未发现待整理项目。隐藏目录、符号链接、照片图库和已有归档目录会跳过。' : '选择本机文件夹或输入路径，扫描后为每个项目找到合适的标签。'}</p>
+              {!scan && <div className="empty-tags">{['文档', '照片视频', '音频', '压缩包', '安装包', '其他'].map(name => <span key={name}>{name}</span>)}</div>}</div>
+            <div className="table-bottom"><span id="selection-count">{scan ? `已选择 ${selected.length} / ${items.length} 个项目` : '尚未选择项目'}</span><span>每批最多 500 项 · 同名不覆盖 · 可撤销</span></div></div>
+          <div className="execution-bar" role="region" aria-label="整理操作"><div className="execution-summary"><strong>已选择 {selected.length} 项</strong><span>{selected.length > 500 ? '本次处理前 500 项，其余保留待下一批' : '检查预览后确认移动，支持撤销'}</span></div>{selectedInbox && <label className="auto-option"><input id="auto" type="checkbox" checked={auto} disabled={busy || !session?.aiEnabled} onChange={event => setAuto(event.target.checked)} />
+            <span>自动整理高置信度结果<small>开启后，AI 推荐完成即移动置信度 ≥ 85% 且非「其他」的项目。</small></span></label>}
+            <button id="move" className="primary" disabled={busy || !selected.length} onClick={() => { setPendingMove(selected.slice(0, 500)); dialog.current.showModal(); }}>执行整理{selected.length ? `（${Math.min(selected.length, 500)}）` : ''} <span>→</span></button></div>
         </section><footer>内容保持完整，改变的只是位置。<span>LOCAL FIRST · THOUGHTFULLY ORGANIZED</span></footer>
       </section>}
+      {view === 'completed' && <><History batches={history} busy={busy} onRefresh={() => run(loadHistory)} onUndo={undo} completed />
+        <div id="completed-notice" className={`notice${notice.error ? ' error' : ''}`} role="status" aria-live="polite" hidden={!notice.text}>{notice.text}</div></>}
       {view === 'history' && <><History batches={history} busy={busy} onRefresh={() => run(loadHistory)} onUndo={undo} />
         <div id="history-notice" className={`notice${notice.error ? ' error' : ''}`} role="status" aria-live="polite" hidden={!notice.text}>{notice.text}</div></>}
     </main>
+    {busy && <div className="operation-progress" role="status" aria-live="polite"><span>{notice.text || '正在处理，请稍候…'}</span><progress aria-label="操作进行中" /></div>}
     <dialog ref={dialog} id="confirm-dialog" onClose={event => {
       if (event.currentTarget.returnValue === 'confirm') run(() => performMove(pendingMove));
       setPendingMove([]);
     }}><form method="dialog"><span className="dialog-icon">↳</span><h2>准备好让它们各归其位了吗？</h2>
-      <p id="confirm-description">将 {pendingMove.length} 个文件或文件夹移至「{scan?.root}」下预览的位置。</p>
+      <p id="confirm-description">将 {pendingMove.length} 个项目移至「{scan?.root}」下预览的位置。媒体提取成功后会清理变空的源目录；撤销时重建目录。</p>
       <p className="subtle">文件内容与文件夹内部结构不会改变。遇到同名目标会跳过，你可以在操作记录中撤销。</p>
       <div className="dialog-actions"><button value="cancel" className="secondary">再检查一下</button><button value="confirm" className="primary">确认移动</button></div></form></dialog>
   </div>;

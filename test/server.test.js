@@ -32,7 +32,8 @@ test('HTTP restart scans and moves a recovered Live Photo without first opening 
 test('HTTP workflow and local request protection', async t => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'jev-http-'));
   const root = path.join(temp, 'items');
-  await fs.mkdir(path.join(root, '课程'), { recursive: true });
+  await fs.mkdir(root, { recursive: true });
+  await fs.writeFile(path.join(root, '课程.pdf'), 'course');
   const server = createApp({ dataDir: path.join(temp, 'data') });
   t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await fs.rm(temp, { recursive: true, force: true }); });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
@@ -56,7 +57,7 @@ test('HTTP workflow and local request protection', async t => {
   const noClassification = await post('/api/classify', { scanId: scan.id, itemIds: [] });
   assert.deepEqual(await noClassification.json(), []);
   assert.equal((await post('/api/classify', { scanId: scan.id, itemIds: ['fake'] })).status, 400);
-  const batch = await (await post('/api/move', { scanId: scan.id, selections: [{ id: scan.items[0].id, category: '学习' }] })).json();
+  const batch = await (await post('/api/move', { scanId: scan.id, selections: [{ id: scan.items[0].id, category: '文档' }] })).json();
   assert.equal(batch.entries[0].status, 'moved');
   const undo = await (await post('/api/undo', { id: batch.id })).json();
   assert.equal(undo.entries[0].status, 'undone');
@@ -142,7 +143,7 @@ test('HTTP rejects media classification and arbitrary destinations before any mo
   assert.equal((await fixture.post('classify', { scanId: scan.id, itemIds: [ordinary.id, media.id] })).status, 400);
   assert.equal(fixture.classifications(), 0);
   assert.equal((await fixture.post('classify', { scanId: scan.id, itemIds: [ordinary.id] })).status, 200);
-  assert.equal(fixture.classifications(), 1);
+  assert.equal(fixture.classifications(), 0);
   const selections = [
     { id: media.id, media: {}, target: '/tmp/escape' },
     { id: media.id, media: {}, targetSegments: ['2026'] },
@@ -163,5 +164,5 @@ test('HTTP rejects media classification and arbitrary destinations before any mo
   assert.equal(response.status, 200);
   const batch = await response.json();
   assert.equal(batch.entries[0].status, 'moved');
-  assert.equal(await fs.readFile(path.join(fixture.root, '2026/09/中国/杭州/照片/photo.jpg'), 'utf8'), 'photo.jpg');
+  assert.equal(await fs.readFile(path.join(fixture.root, scan.outputDirectory, '照片视频/2026/2026-09/2026-09-21/photo.jpg'), 'utf8'), 'photo.jpg');
 });

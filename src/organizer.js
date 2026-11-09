@@ -1,14 +1,18 @@
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { categoryForFile, fileTypeCategories } from './file-types.js';
 import { categoryNames } from './categories.js';
 import { GeocodeCache } from './geocode-cache.js';
 import { inspectMedia, reverseGeocode } from './media-native.js';
-import { scanMedia, toPublicScan } from './media-scanner.js';
+import { scanMedia, toPublicScan, isCandidate } from './media-scanner.js';
 import { buildMediaSegments } from './media-rules.js';
 import { validateMediaOverrides } from '../public/media-paths.js';
 
-const ignored = new Set(['node_modules', '.git', ...categoryNames]);
+const archiveDirectory = name => name === '照片视频' || name === '日期待确认' || name === '未知日期';
+const datedArchive = name => /^整理_\d{8}$/.test(name);
+const knownContainer = name => categoryNames.includes(name) || fileTypeCategories.includes(name) || archiveDirectory(name) || datedArchive(name) || /^\d{4}(?:-\d{2}(?:-\d{2})?)?$/.test(name);
+const ignored = new Set(['node_modules', '.git', ...categoryNames, ...fileTypeCategories]);
 // 文件系统安全基础函数：只接受真实文件/目录，并记录身份防止扫描后被替换。
 const kind = stat => stat.isDirectory() ? 'folder' : stat.isFile() ? 'file' : null;
 const identity = stat => ({ dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs, type: kind(stat) });
@@ -62,6 +66,7 @@ export class Organizer {
     this.geocodeCache = options.geocodeCache ?? new GeocodeCache(path.join(this.dataDir, 'geocode-cache.json'));
     this.timeZone = options.timeZone;
     this.rename = options.rename ?? fs.rename;
+    this.now = options.now ?? (() => new Date());
   }
 
   exclusive(fn) {
@@ -88,11 +93,24 @@ export class Organizer {
     if (root === path.parse(root).root || this.dataDir === root || this.dataDir.startsWith(root + path.sep)) {
       throw new Error('请选择具体的待整理目录，不能扫描根目录或包含本工具运行数据的目录。');
     }
+    const mode = options.mode ?? 'normal';
+    if (!['normal', 'reorganize'].includes(mode)) throw new Error('整理模式无效。');
+    const reorganize = mode === 'reorganize';
+    const customContainers = new Set((options.categories ?? []).flatMap(category => category.split('/')));
+    const isContainer = name => knownContainer(name) || customContainers.has(name);
+    // Freeze the local run date in the scan snapshot; a midnight move must use
+    // the exact destination the user reviewed, rather than calculate a new one.
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: this.timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(this.now());
+    const datePart = type => parts.find(part => part.type === type).value;
+    const outputDirectory = options.preserveFolders ? `整理_${datePart('year')}${datePart('month')}${datePart('day')}` : '';
+    const outputPath = outputDirectory ? path.join(root, outputDirectory) : null;
     const ordinaryItems = [], fileCandidates = [], skipped = [];
     const directory = await fs.opendir(root);
     for await (const entry of directory) {
       if ((!entry.isDirectory() && !entry.isFile()) || entry.isSymbolicLink()) continue;
-      if (entry.name.startsWith('.') || (entry.isDirectory() && (ignored.has(entry.name) || entry.name.toLowerCase().endsWith('.photoslibrary')))) {
+      if (entry.name.startsWith('.') || entry.name === 'node_modules' || entry.name.toLowerCase().endsWith('.photoslibrary')
+          || path.join(root, entry.name) === outputPath
+          || (!reorganize && entry.isDirectory() && (ignored.has(entry.name) || customContainers.has(entry.name) || archiveDirectory(entry.name) || datedArchive(entry.name)))) {
         skipped.push(entry.name); continue;
       }
       const location = path.join(root, entry.name);
@@ -100,7 +118,7 @@ export class Organizer {
         const stat = await checkItem(location);
         const type = kind(stat);
         let samples = [], warning = null;
-        if (type === 'folder') {
+        if (type === 'folder' && !options.preserveFolders) {
           try { samples = await samplesFor(location); } catch { warning = '部分内部目录无法读取，分类仅使用可获得的信息。'; }
         }
         const item = { id: randomUUID(), name: entry.name, type, extension: type === 'file' ? path.extname(entry.name).toLowerCase() : '',
@@ -109,6 +127,33 @@ export class Organizer {
         else ordinaryItems.push(item);
       } catch { skipped.push(entry.name); }
     }
+    const nestedTopFolders = new Set();
+    const archiveYears = new Set();
+    const visit = async (directoryPath, sourceDirectories = [], ordinaryContainer = false) => {
+      const stat = await checkDirectory(directoryPath);
+      const chain = [...sourceDirectories, { path: directoryPath, identity: identity(stat) }];
+      for await (const entry of await fs.opendir(directoryPath)) {
+        if (entry.name.startsWith('.') || entry.isSymbolicLink()) continue;
+        const location = path.join(directoryPath, entry.name);
+        if (entry.isDirectory()) {
+          const oldMonth = /^\d{4}$/.test(path.basename(directoryPath)) && entry.name.startsWith(path.basename(directoryPath) + '-') && /^\d{4}-(0[1-9]|1[0-2])$/.test(entry.name);
+          if (!reorganize && oldMonth) archiveYears.add(path.relative(root, directoryPath).split(path.sep)[0]);
+          if (location === outputPath || entry.name === 'node_modules' || entry.name.toLowerCase().endsWith('.photoslibrary')
+              || (!reorganize && (oldMonth || ignored.has(entry.name) || customContainers.has(entry.name) || archiveDirectory(entry.name) || datedArchive(entry.name)))) continue;
+          try { await visit(location, chain, ordinaryContainer && isContainer(entry.name)); } catch { skipped.push(path.relative(root, location)); }
+        } else if (entry.isFile() && (isCandidate({name:entry.name}) || reorganize && ordinaryContainer)) {
+          try {
+            const fileStat = await checkItem(location);
+            const relative = path.relative(root, location);
+            fileCandidates.push({ id: randomUUID(), name: entry.name, path: location, type: 'file', extension: path.extname(entry.name).toLowerCase(), sizeBytes: fileStat.size, samples: [], identity: identity(fileStat),
+              birthtime: fileStat.birthtime, sourceRelativePath: relative, sourceDirectories: chain, allowOrdinary: ordinaryContainer });
+          } catch { skipped.push(path.relative(root, location)); }
+        }
+      }
+    };
+    for (const folder of ordinaryItems) {
+      try { await visit(path.join(root, folder.name), [], reorganize && isContainer(folder.name)); } catch { skipped.push(folder.name); }
+    }
     const scannedMedia = await scanMedia(fileCandidates, {
       inspectMedia: this.inspectMedia,
       reverseGeocode: this.reverseGeocode,
@@ -116,12 +161,24 @@ export class Organizer {
       resolveLocations: options.resolveLocations === true,
       timeZone: options.timeZone ?? this.timeZone
     });
-    const ordinaryFiles = scannedMedia.ordinaryPaths.map(({ path: privatePath, birthtime, ...item }) => item);
-    const items = [...ordinaryItems, ...ordinaryFiles, ...scannedMedia.mediaItems];
-    if (items.length > 500) throw new Error('直属文件和文件夹超过 500 项，请分批选择更小的父目录。');
+    for (const item of scannedMedia.mediaItems) {
+      for (const member of item.members) {
+        const relative = path.relative(root, member.path);
+        if (relative.includes(path.sep)) nestedTopFolders.add(relative.split(path.sep)[0]);
+      }
+    }
+    const ordinaryFiles = scannedMedia.ordinaryPaths.filter(item => !item.sourceRelativePath || reorganize && item.allowOrdinary).map(({ birthtime, ...item }) => item);
+    const availableCategories = options.categories?.length ? options.categories : options.preserveFolders ? fileTypeCategories : categoryNames;
+    if (options.preserveFolders) for (const item of ordinaryFiles) {
+      const category = categoryForFile(item.name);
+      if (availableCategories.includes(category)) Object.assign(item, { category, confidence: 1, recommendationSource: 'file-type' });
+    }
+    const items = [...ordinaryItems.filter(item => !options.preserveFolders && !nestedTopFolders.has(item.name) && !archiveYears.has(item.name)), ...ordinaryFiles, ...scannedMedia.mediaItems];
+    if (items.filter(item => item.type !== 'media').length > 500) throw new Error('直属文件和文件夹超过 500 项，请分批选择更小的父目录。');
     items.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
-    const scan = { id: randomUUID(), root, rootIdentity, items, skipped,
-      allowedCategories: Array.isArray(options.categories) && options.categories.length ? [...options.categories] : [...categoryNames] };
+    for (const item of scannedMedia.mediaItems) item.targetSegments = [...(outputDirectory ? [outputDirectory] : []), ...item.targetSegments];
+    const scan = { id: randomUUID(), root, rootIdentity, items, skipped, outputDirectory, mode,
+      allowedCategories: [...availableCategories], cleanupEmptySources: options.preserveFolders === true };
     this.scans.set(scan.id, scan);
     if (this.scans.size > 20) this.scans.delete(this.scans.keys().next().value);
     return toPublicScan(scan, { exposeCoordinates: options.resolveLocations === true });
@@ -174,6 +231,21 @@ export class Organizer {
 
   async recover(batch) {
     let changed = false;
+    for (const directory of batch.cleanupDirectories ?? []) {
+      if (!['removing', 'restoring'].includes(directory.state)) continue;
+      contained(batch.root, directory.path);
+      const stat = await statOrNull(directory.path);
+      if (directory.state === 'removing') {
+        if (!stat) directory.state = 'removed';
+        else if (same(stat, directory.identity)) directory.state = 'kept';
+        else directory.state = 'uncertain';
+      } else {
+        // A crash after mkdir but before recording identity cannot be guessed safe.
+        directory.state = stat ? 'uncertain' : 'removed';
+      }
+      changed = true;
+    }
+    await this.propagateRestoredDirectories(batch);
     for (const entry of batch.entries) {
       if (!['pending', 'undoing'].includes(entry.status)) continue;
       await this.recoverEntry(entry, batch);
@@ -229,7 +301,7 @@ export class Organizer {
       });
       checkSelectionIndependence(scan, entries);
       await checkDirectory(scan.root, scan.rootIdentity);
-      const batch = { id: randomUUID(), root: scan.root, rootIdentity: scan.rootIdentity, createdAt: new Date().toISOString(), entries };
+      const batch = { id: randomUUID(), root: scan.root, rootIdentity: scan.rootIdentity, createdAt: new Date().toISOString(), entries, mode: scan.mode, ...(scan.cleanupEmptySources ? { cleanupDirectories: [] } : {}) };
       await this.save(batch);
       for (const entry of entries) {
         try {
@@ -250,7 +322,7 @@ export class Organizer {
           for (const member of orderedMembers(entry)) {
             await checkEntryDirectories(batch, entry);
             await checkItem(member.source, member.identity);
-            if (await statOrNull(member.target)) throw new Error('目标已存在，已跳过，未覆盖。');
+            if (await statOrNull(member.target)) throw new Error(targetConflictMessage(batch, member));
             await this.rename(member.source, member.target);
             member.status = 'moved';
           }
@@ -267,13 +339,126 @@ export class Organizer {
         // Keep completion-save failures outside compensation: durable pending enables recovery.
         await this.save(batch);
       }
+      if (batch.cleanupDirectories) await this.cleanupSources(batch);
       return batch;
     });
+  }
+
+  // 清理只发生在移动结果已落盘之后；不得递归删除，也不清理原本就空的目录。
+  async cleanupSources(batch) {
+    const candidates = new Map();
+    for (const entry of batch.entries) {
+      if ((entry.type !== 'media' && !(batch.mode === 'reorganize' && entry.type === 'file')) || entry.status !== 'moved') continue;
+      for (const member of entry.members) for (const directory of member.sourceDirectories ?? []) {
+        contained(batch.root, directory.path);
+        candidates.set(directory.path, directory);
+      }
+    }
+    for (const directory of [...candidates.values()].sort((a, b) => b.path.split(path.sep).length - a.path.split(path.sep).length)) {
+      const record = { path: directory.path, identity: directory.identity, state: 'removing' };
+      try {
+        await checkDirectory(batch.root, batch.rootIdentity);
+        await checkDirectory(directory.path, directory.identity);
+        // rmdir is deliberately non-recursive and will preserve even hidden files.
+        batch.cleanupDirectories.push(record);
+        await this.save(batch);
+        // A journal write yields to other processes. Recheck the entire source
+        // ancestry afterwards; a replacement empty directory is not ours to delete.
+        await validateSourceAncestors(batch, directory.path, true);
+        await fs.rmdir(directory.path);
+        record.state = 'removed';
+      } catch (error) {
+        if (!batch.cleanupDirectories.includes(record)) batch.cleanupDirectories.push(record);
+        record.state = 'kept';
+        if (!['ENOTEMPTY', 'EEXIST'].includes(error.code)) record.error = error.message;
+      }
+      await this.save(batch);
+    }
+  }
+
+  // 删除空目录会改变 inode。撤销必须重建目录、更新所有相关批次的身份，
+  // 不能把用户后来创建的同名目录当成原目录，也不能依赖撤销顺序。
+  async restoreSourceDirectories(batch, findOtherBatches = true) {
+    await this.propagateRestoredDirectories(batch);
+    if (findOtherBatches) {
+      // A later batch can remove a shared directory after an earlier batch only
+      // emptied some of its files. The removal journal, not the undo order, owns
+      // permission to recreate that directory.
+      const missing = [];
+      for (const reference of sourceDirectoryReferences(batch)) {
+        if (!await statOrNull(reference.path)
+            && !batch.cleanupDirectories?.some(directory => directory.path === reference.path && directory.state === 'removed')) missing.push(reference);
+      }
+      if (missing.length) {
+        for (const name of await fs.readdir(this.dataDir)) {
+          if (!/^[a-f0-9-]{36}\.json$/.test(name) || name === `${batch.id}.json`) continue;
+          const other = await this.recover(await this.readBatch(name.slice(0, -5)));
+          if (other.root !== batch.root || !equalIdentity(other.rootIdentity, batch.rootIdentity)) continue;
+          if (other.cleanupDirectories?.some(directory => directory.state === 'removed'
+              && missing.some(reference => reference.path === directory.path && equalIdentity(reference.identity, directory.identity)))) {
+            await this.restoreSourceDirectories(other, false);
+          }
+        }
+        // Other journals have updated this batch's source inode references.
+        Object.assign(batch, await this.readBatch(batch.id));
+      }
+    }
+    const removed = (batch.cleanupDirectories ?? []).filter(directory => directory.state === 'removed')
+      .sort((a, b) => a.path.split(path.sep).length - b.path.split(path.sep).length);
+    if (batch.cleanupDirectories?.some(directory => directory.state === 'uncertain')) throw new Error('源目录身份无法确认，请手动核对操作记录。');
+    for (const directory of removed) {
+      contained(batch.root, directory.path);
+      await checkDirectory(batch.root, batch.rootIdentity);
+      if (await statOrNull(directory.path)) throw new Error('已清理的源目录被重新创建，身份无法确认。');
+      const references = sourceDirectoryReferences(batch);
+      await validateSourceAncestors(batch, directory.path);
+      directory.state = 'restoring';
+      await this.save(batch);
+      // Revalidate after the durable intent write: mkdir must never follow a
+      // source parent swapped for a symlink while the journal was being saved.
+      await validateSourceAncestors(batch, directory.path);
+      await fs.mkdir(directory.path);
+      directory.previousIdentity = directory.identity;
+      directory.propagated = false;
+      directory.identity = identity(await checkDirectory(directory.path));
+      directory.state = 'restored';
+      for (const reference of references) if (reference.path === directory.path) reference.identity = directory.identity;
+      await this.save(batch);
+    }
+    await this.propagateRestoredDirectories(batch);
+  }
+
+  // 先持久化旧/新身份及未传播标记，再幂等更新其他日志，最后标记完成。
+  // 任一步中断都能重试；mkdir 后身份尚未落盘的窗口则保守标为 uncertain。
+  async propagateRestoredDirectories(batch) {
+    for (const directory of batch.cleanupDirectories ?? []) {
+      if (directory.state !== 'restored' || directory.propagated !== false) continue;
+      contained(batch.root, directory.path);
+      await checkDirectory(batch.root, batch.rootIdentity);
+      await checkDirectory(directory.path, directory.identity);
+      // Persist both identities before fan-out. Repeating this loop after any
+      // crash is safe: only references to the old inode are changed.
+      for (const name of await fs.readdir(this.dataDir)) {
+        if (!/^[a-f0-9-]{36}\.json$/.test(name) || name === `${batch.id}.json`) continue;
+        const other = await this.readBatch(name.slice(0, -5));
+        if (other.root !== batch.root || !equalIdentity(other.rootIdentity, batch.rootIdentity)) continue;
+        let changed = false;
+        for (const reference of sourceDirectoryReferences(other)) {
+          if (reference.path === directory.path && equalIdentity(reference.identity, directory.previousIdentity)) {
+            reference.identity = directory.identity; changed = true;
+          }
+        }
+        if (changed) await this.save(other);
+      }
+      directory.propagated = true;
+      await this.save(batch);
+    }
   }
 
   undo(id) {
     return this.exclusive(async () => {
       const batch = await this.recover(await this.readBatch(id));
+      if (batch.cleanupDirectories || sourceDirectoryReferences(batch).length) await this.restoreSourceDirectories(batch);
       for (const entry of [...batch.entries].reverse()) {
         if (entry.status !== 'moved') continue;
         try {
@@ -309,7 +494,7 @@ export class Organizer {
 function assertRecoveredRoot(root, batches) {
   const contains = (parent, child) => child === parent || child.startsWith(parent + path.sep);
   for (const batch of batches) {
-    if (batch.entries.some(entry => ['pending', 'undoing', 'uncertain'].includes(entry.status))
+    if ((batch.entries.some(entry => ['pending', 'undoing', 'uncertain'].includes(entry.status)) || batch.cleanupDirectories?.some(directory => directory.state === 'uncertain'))
         && (contains(root, batch.root) || contains(batch.root, root))) {
       throw new Error('此目录存在中断后状态不确定的操作，请先在操作记录中手动核对，暂不能继续扫描或整理。');
     }
@@ -345,24 +530,27 @@ function prepareSelection(scan, selection) {
     const allowedCategories = scan.allowedCategories ?? categoryNames;
     if (!allowedCategories.includes(selection.category)) throw new Error('分类选择无效，请重新扫描。');
     segments = [selection.category];
-    originals = [{ name: item.name, identity: item.identity }];
+    originals = [{ name: item.name, path: item.path, identity: item.identity, sourceDirectories: item.sourceDirectories }];
   }
+  if (scan.outputDirectory) segments.unshift(safeSegment(scan.outputDirectory));
   const members = originals.map(original => {
     // A basename from the retained scan is not a client-supplied directory segment.
     if (typeof original.name !== 'string' || path.basename(original.name) !== original.name
         || original.name === '.' || original.name === '..' || original.name.includes('\0')) throw new Error('源文件名无效。');
-    const source = path.join(scan.root, original.name), target = path.join(scan.root, ...segments, original.name);
+    const source = original.path ?? path.join(scan.root, original.name), target = path.join(scan.root, ...segments, original.name);
     contained(scan.root, source); contained(scan.root, target);
-    return { name: original.name, source, target, identity: original.identity, status: 'ready' };
+    return { name: original.name, source, target, identity: original.identity, ...(original.sourceDirectories ? { sourceDirectories: original.sourceDirectories } : {}), status: 'ready' };
   }).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
   if (!members.length || new Set(members.map(member => member.name)).size !== members.length) throw new Error('媒体成员无效。');
-  return { name: item.name, type: item.type, kind: members.length > 1 ? 'group' : 'single',
+  return { name: item.name, scanItemId: item.id, type: item.type, kind: members.length > 1 ? 'group' : 'single',
     ...(item.type === 'media' ? { mediaType: item.mediaType, targetSegments: segments } : { category: selection.category }),
     source: members[0].source, target: members[0].target, identity: members[0].identity, members, status: 'ready' };
 }
 
 // Old journals are one-member views, without adding members to their persisted schema.
 const entryMembers = entry => entry.members ?? [entry];
+const sourceDirectoryReferences = batch => batch.entries.flatMap(entry => entryMembers(entry).flatMap(member => member.sourceDirectories ?? []));
+const equalIdentity = (left, right) => left && right && ['dev', 'ino', 'birthtimeMs', 'type'].every(key => left[key] === right[key]);
 const orderedMembers = entry => [...entryMembers(entry)].sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
 function setEntryStatus(entry, status, location) {
   entry.status = status;
@@ -376,7 +564,7 @@ function containerPaths(batch, entry) {
   const sources = new Set(), targets = new Set();
   for (const member of members) {
     contained(batch.root, member.source); contained(batch.root, member.target);
-    if (path.dirname(member.source) !== batch.root || path.basename(member.source) !== member.name
+    if ((path.dirname(member.source) !== batch.root && !member.sourceDirectories?.length) || path.basename(member.source) !== member.name
         || path.basename(member.target) !== member.name || !member.identity
         || sources.has(member.source) || targets.has(member.target)) throw new Error('操作记录路径无效。');
     sources.add(member.source); targets.add(member.target);
@@ -397,15 +585,24 @@ function checkSelectionIndependence(scan, entries) {
     return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
   };
   const overlaps = (left, right) => contains(left, right) || contains(right, left);
-  const reject = () => { throw new Error('所选项目路径存在冲突，请分批整理。'); };
+  const reject = (left, right, reason) => {
+    throw new Error(`所选项目路径存在不安全的重叠冲突，本批尚未开始移动。\n原因：${reason}\n路径一：${path.relative(scan.root, left)}\n路径二：${path.relative(scan.root, right)}\n请取消选择互相包含的项目，或重新选择整理范围。`);
+  };
   for (let i = 0; i < members.length; i++) {
     const left = members[i];
     // A selected source must never be reused or recreated as any destination container.
-    if (containers.some(container => overlaps(left.source, container))) reject();
+    const container = containers.find(candidate => overlaps(left.source, candidate));
+    if (container) reject(left.source, container, '源项目与将创建或使用的归档目录重叠');
     for (let j = i; j < members.length; j++) {
       const right = members[j];
-      if (overlaps(left.source, right.target) || overlaps(left.target, right.source)
-          || (i !== j && (overlaps(left.source, right.source) || overlaps(left.target, right.target)))) reject();
+      if (overlaps(left.source, right.target)) reject(left.source, right.target, '源项目与目标位置互相包含');
+      if (overlaps(left.target, right.source)) reject(left.target, right.source, '目标位置与源项目互相包含');
+      if (i !== j && overlaps(left.source, right.source)) reject(left.source, right.source, '源项目被重复选择或互相包含');
+      // 同名目标只放行逐项空位检查，不覆盖、不拆组；真正的目录重叠仍整批拒绝。
+      // Equal target files are safe to attempt sequentially: the first successful
+      // entry reserves the name on disk, then the later entry's vacancy check
+      // skips its entire group. Ancestor/descendant target overlaps stay unsafe.
+      if (i !== j && left.target !== right.target && overlaps(left.target, right.target)) reject(left.target, right.target, '两个目标位置互相包含');
     }
   }
 }
@@ -423,6 +620,19 @@ async function createContainers(batch, entry) {
 
 async function checkEntryDirectories(batch, entry) {
   await checkDirectory(batch.root, batch.rootIdentity);
+  for (const member of entryMembers(entry)) {
+    if (path.dirname(member.source) === batch.root) continue;
+    const chain = member.sourceDirectories;
+    let current = batch.root;
+    for (const segment of path.relative(batch.root, path.dirname(member.source)).split(path.sep)) {
+      current = path.join(current, safeSegment(segment));
+      const recorded = chain?.find(directory => directory.path === current);
+      if (!recorded?.identity) throw new Error('操作记录缺少源目录身份。');
+      const removed = batch.cleanupDirectories?.find(directory => directory.path === current && directory.state === 'removed');
+      if (removed && !await statOrNull(current)) continue;
+      await checkDirectory(current, recorded.identity);
+    }
+  }
   const paths = containerPaths(batch, entry);
   for (const directory of paths) {
     const recorded = entry.containers?.find(container => container.path === directory);
@@ -431,12 +641,35 @@ async function checkEntryDirectories(batch, entry) {
   }
 }
 
+// Validate the whole source chain, not just the leaf inode. A genuine leaf can
+// be moved underneath a replacement parent without changing its own identity.
+async function validateSourceAncestors(batch, location, includeSelf = false) {
+  await checkDirectory(batch.root, batch.rootIdentity);
+  const references = sourceDirectoryReferences(batch);
+  const parent = includeSelf ? location : path.dirname(location);
+  let current = batch.root;
+  for (const segment of path.relative(batch.root, parent).split(path.sep).filter(Boolean)) {
+    current = path.join(current, safeSegment(segment));
+    const recorded = references.find(directory => directory.path === current);
+    if (!recorded) throw new Error('缺少源目录身份。');
+    await checkDirectory(current, recorded.identity);
+  }
+}
+
+function targetConflictMessage(batch, member) {
+  const other = batch.entries.filter(entry => entry.status === 'moved').flatMap(entryMembers)
+    .find(candidate => candidate.target === member.target && candidate.source !== member.source);
+  return `目标已存在（目标文件冲突），已跳过，未覆盖。\n来源：${path.relative(batch.root, member.source)}\n目标：${path.relative(batch.root, member.target)}`
+    + (other ? `\n本批已归档的另一来源：${path.relative(batch.root, other.source)}` : '')
+    + '\n请重命名源文件，或调整分类/日期后重试。重命名后需要重新扫描。';
+}
+
 async function preflight(batch, entry, origin) {
   await checkEntryDirectories(batch, entry);
   for (const member of entryMembers(entry)) {
     await checkItem(member[origin], member.identity);
     if (await statOrNull(member[origin === 'source' ? 'target' : 'source'])) {
-      throw new Error(origin === 'source' ? '目标已存在，已跳过，未覆盖。' : '原位置已存在同名项目，未覆盖，可解决冲突后再次撤销。');
+      throw new Error(origin === 'source' ? targetConflictMessage(batch, member) : '原位置已存在同名项目，未覆盖，可解决冲突后再次撤销。');
     }
   }
 }
